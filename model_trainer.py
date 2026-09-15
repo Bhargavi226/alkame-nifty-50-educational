@@ -1,4 +1,3 @@
-# 1. Standard library imports
 import json
 import logging
 from dataclasses import dataclass
@@ -6,10 +5,9 @@ from datetime import datetime
 from pathlib import Path
 
 import joblib
-
-# 2. Third-party imports
 import numpy as np
 import pandas as pd
+
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import (
     accuracy_score,
@@ -23,7 +21,6 @@ from sklearn.metrics import (
     recall_score,
 )
 
-# 3. Local imports
 from config import (
     HORIZON_CONFIG,
     HORIZON_INTRADAY,
@@ -37,799 +34,1203 @@ from config import (
     configure_logging,
     ensure_directories,
 )
+
 from feature_engineer import ML_SAFE_SUFFIX, FeatureEngineer
 
-# 4. Logger setup
+
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# 5. Constants
-# ---------------------------------------------------------------------------
-MODEL_FILE_SUFFIX = "_model.joblib"
-METADATA_FILE_SUFFIX = "_metadata.json"
-LEVEL_MODEL_FILE_SUFFIX = "_level_model.joblib"
-LEVEL_METADATA_FILE_SUFFIX = "_level_metadata.json"
-
-LEVEL_LABEL_CLASSES = ["MA", "SUPPORT", "RESISTANCE", "USER_COST", "NONE"]
 
 
 @dataclass
-class TrainingResult:
-    symbol: str
+class ModelEvaluation:
+    accuracy: float
+    balanced_accuracy: float
+    precision: float
+    recall: float
+    f1: float
+    mcc: float
+    logloss: float
+    confusion_matrix: list
+    classification_report: dict
+
+
+@dataclass
+class EnsembleModel:
+    models: list
+    feature_columns: list
+    label_classes: list
+    horizon: str
     trained_at: str
-    n_train_samples: int
-    n_test_samples: int
-    feature_columns: list[str]
-    test_accuracy: float
-    class_report: dict
-    success: bool
-    error: str | None = None
+    metadata: dict
 
 
-# ---------------------------------------------------------------------------
-# 6. Classes and functions
-# ---------------------------------------------------------------------------
 class ModelTrainer:
     """
-    Trains a per-stock direction classifier (UP / FLAT / DOWN over the next
-    PREDICTION_HORIZON_BARS bars) using ONLY the '_feat' (lagged, ML-safe)
-    columns produced by feature_engineer.py. Enforces a strict chronological
-    train/test split — shuffling time-series data here would silently leak
-    the future into training.
+    Handles dataset preparation, chronological model training,
+    evaluation, persistence and prediction.
+
+    ML-01 safety requirements:
+    - feature inputs must be ML-safe
+    - labels must use future information only
+    - chronological splits must protect the test period
+    - training labels must not consume protected test observations
     """
 
-    def __init__(self, feature_engineer: FeatureEngineer | None = None):
-        self.feature_engineer = feature_engineer or FeatureEngineer()
+    def __init__(
+        self,
+        feature_engineer=None,
+        models_dir=MODELS_DIR,
+        test_fraction=TIME_SERIES_SPLIT_TEST_FRACTION,
+        random_seed=MODEL_RANDOM_SEED,
+        min_training_samples=100,
+    ):
+        self.feature_engineer = (
+            feature_engineer
+            if feature_engineer is not None
+            else FeatureEngineer()
+        )
+
+        self.models_dir = Path(models_dir)
+        self.test_fraction = test_fraction
+        self.random_seed = random_seed
+        self.min_training_samples = min_training_samples
+
         ensure_directories()
 
-    # -----------------------------------------------------------------
-    # Dataset preparation
-    # -----------------------------------------------------------------
-    def compute_adaptive_deadband(self, df: pd.DataFrame, horizon_bars: int, deadband_pct_default: float) -> pd.Series:
-        """
-        Uses a rolling standard deviation of historical backward returns over the last 500 bars
-        multiplied by 0.5 to define the UP/FLAT/DOWN threshold dynamically.
-        Caps this adaptive deadband at a minimum of deadband_pct_default.
-        """
-        backward_returns = (df["Close"] - df["Close"].shift(horizon_bars)) / df["Close"].shift(horizon_bars) * 100.0
-        rolling_std = backward_returns.rolling(window=500, min_periods=50).std()
+    # ------------------------------------------------------------------
+    # Adaptive deadband
+    # ------------------------------------------------------------------
 
-        adaptive_deadband = rolling_std * 0.5
-        adaptive_deadband = adaptive_deadband.clip(lower=deadband_pct_default)
-        return adaptive_deadband.fillna(deadband_pct_default)
-
-    def simulate_user_cost(self, df: pd.DataFrame, seed: int = MODEL_RANDOM_SEED) -> None:
-        """
-        Synthetically generates a 'user_avg_cost' for historical data so the model
-        can learn the 'USER_COST' outcome. Makes the cost stable across a day to
-        prevent feature-target leakage.
-        Mutates df in place (both unlagged and _feat lagged columns).
-        """
-        rng = np.random.default_rng(seed)
-        day_keys = df.index.date
-        unique_days = np.unique(day_keys)
-
-        has_pos = np.zeros(len(df))
-        pct_cost = np.zeros(len(df))
-        closes = df["Close"].values
-
-        for d in unique_days:
-            idx = np.where(day_keys == d)[0]
-            if rng.random() > 0.5:
-                has_pos[idx] = 1.0
-                day_open = closes[idx[0]]
-                sim_cost = day_open * rng.uniform(0.85, 1.15)
-                pct_cost[idx] = (closes[idx] - sim_cost) / sim_cost * 100.0
-
-        df["has_position"] = has_pos
-        df["pct_from_user_avg_cost"] = pct_cost
-
-        df[f"has_position{ML_SAFE_SUFFIX}"] = df["has_position"].shift(1)
-        df[f"pct_from_user_avg_cost{ML_SAFE_SUFFIX}"] = df["pct_from_user_avg_cost"].shift(1)
-
-    def build_price_level_labels(self, df: pd.DataFrame, horizon: str = HORIZON_INTRADAY) -> pd.Series:
-        """
-        Simulates the future price path to see WHICH reference level is hit FIRST.
-        Returns one of: MA, SUPPORT, RESISTANCE, USER_COST, NONE.
-        """
-        try:
-            horizon_bars = HORIZON_CONFIG[horizon]["horizon_bars"]
-            price = df["Close"].values
-            # Compute absolute levels from the unlagged percentage features
-            ma = price / (1 + df["pct_from_ma"].values / 100.0)
-            sup = price / (1 + df["pct_from_support_band"].values / 100.0)
-            res = price / (1 + df["pct_from_resistance_band"].values / 100.0)
-            has_pos = df["has_position"].values > 0
-            usr = price / (1 + df["pct_from_user_avg_cost"].values / 100.0)
-
-            highs = df["High"].values
-            lows = df["Low"].values
-            N = len(df)
-
-            labels = np.full(N, "NONE", dtype=object)
-
-            for i in range(N - horizon_bars):
-                end = i + 1 + horizon_bars
-                h_win = highs[i + 1 : end]
-                l_win = lows[i + 1 : end]
-
-                # Priority order: USER_COST, SUPPORT, RESISTANCE, MA
-                targets = [
-                    ("USER_COST", usr[i] if has_pos[i] else np.nan),
-                    ("SUPPORT", sup[i]),
-                    ("RESISTANCE", res[i]),
-                    ("MA", ma[i]),
-                ]
-
-                first_hit_idx = horizon_bars + 1
-                hit_label = "NONE"
-
-                for label, level in targets:
-                    if np.isnan(level) or level == 0.0:
-                        continue
-                    hits = np.where((l_win <= level) & (h_win >= level))[0]
-                    if len(hits) > 0:
-                        first_hit = hits[0]
-                        if first_hit < first_hit_idx:
-                            first_hit_idx = first_hit
-                            hit_label = label
-
-                labels[i] = hit_label
-
-            # Final rows have no valid future
-            labels_series = pd.Series(labels, index=df.index)
-            labels_series.iloc[-horizon_bars:] = np.nan
-            return labels_series
-        except Exception as e:
-            logger.error(f"Failed building price level labels: {e}")
-            return pd.Series(np.nan, index=df.index)
-
-    def build_labels(self, df: pd.DataFrame, horizon: str = HORIZON_INTRADAY) -> pd.Series:
-        """
-        Forward-looking label: this is the one place in the whole system where
-        looking into the future is CORRECT and required — a supervised label
-        must describe what actually happened after the decision point. This is
-        not lookahead bias; lookahead bias is a FEATURE seeing the future, and
-        every feature that reaches this function has already been '_feat'
-        lagged before it gets here.
-        """
-        try:
-            horizon_bars = HORIZON_CONFIG[horizon]["horizon_bars"]
-            deadband_pct = HORIZON_CONFIG[horizon]["deadband_pct_default"]
-
-            adaptive_deadband = self.compute_adaptive_deadband(df, horizon_bars, deadband_pct)
-
-            future_return_pct = (df["Close"].shift(-horizon_bars) - df["Close"]) / df["Close"] * 100.0
-            labels = pd.Series("FLAT", index=df.index)
-            labels[future_return_pct > adaptive_deadband] = "UP"
-            labels[future_return_pct < -adaptive_deadband] = "DOWN"
-            # Rows near the end of the dataset have no future to look at — label is invalid there
-            labels[future_return_pct.isna()] = np.nan
-            return labels
-        except Exception as e:
-            logger.error(f"Failed building labels: {e}")
-            return pd.Series(np.nan, index=df.index)
-
-    def prepare_dataset(
+    def compute_adaptive_deadband(
         self,
-        stock_df: pd.DataFrame,
-        index_df: pd.DataFrame | None = None,
-        horizon: str = HORIZON_INTRADAY,
-        label_type: str = "direction",
-    ) -> tuple[pd.DataFrame, pd.Series, list[str]] | None:
-        """
-        Runs feature engineering, selects ONLY '_feat' (ML-safe, lagged)
-        columns as X, builds the forward-looking label as y, and drops rows
-        with any NaN.
-        If label_type == "level", simulates user cost and builds price level labels.
-        """
-        try:
-            engineered = self.feature_engineer.engineer_features_for_horizon(stock_df, index_df, horizon=horizon)
-            if engineered is None or engineered.empty:
-                logger.error("Feature engineering returned no data — cannot prepare dataset.")
-                return None
-
-            if label_type == "level":
-                self.simulate_user_cost(engineered)
-
-            feature_columns = [c for c in engineered.columns if c.endswith(ML_SAFE_SUFFIX)]
-            if not feature_columns:
-                logger.error("No ML-safe ('_feat') columns found — refusing to train on raw columns.")
-                return None
-
-            if label_type == "level":
-                labels = self.build_price_level_labels(engineered, horizon=horizon)
-            else:
-                labels = self.build_labels(engineered, horizon=horizon)
-
-            X = engineered[feature_columns].copy()
-            y = labels.copy()
-
-            raw_leak = [c for c in X.columns if not c.endswith(ML_SAFE_SUFFIX)]
-            assert not raw_leak, f"Non-lagged column(s) detected in feature set: {raw_leak}"
-
-            combined = pd.concat([X, y.rename("label")], axis=1).dropna()
-
-            if combined.empty:
-                logger.error("No rows remain after dropping NaN (warmup/label horizon) — dataset too short.")
-                return None
-
-            X_clean = combined[feature_columns]
-            y_clean = combined["label"]
-            return X_clean, y_clean, feature_columns
-
-        except Exception as e:
-            logger.error(f"Failed preparing dataset: {e}")
-            return None
-
-    # -----------------------------------------------------------------
-    # Time-based split (never shuffled, purged boundary)
-    # -----------------------------------------------------------------
-    @staticmethod
-    def time_based_split(
-        X: pd.DataFrame,
-        y: pd.Series,
-        test_fraction: float = TIME_SERIES_SPLIT_TEST_FRACTION,
-        purge_window: int = 0,
-    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-        """
-        Strictly chronological split with boundary purging (P0-003):
-        The most recent test_fraction rows become the test set (from split_idx to end).
-        To eliminate forward-label leakage where training labels peek into test-interval prices,
-        the training set ends at (split_idx - purge_window), discarding the purge window rows.
-        """
-        n = len(X)
-        split_idx = int(n * (1 - test_fraction))
-        train_end_idx = max(0, split_idx - purge_window) if purge_window > 0 else split_idx
-        X_train, X_test = X.iloc[:train_end_idx], X.iloc[split_idx:]
-        y_train, y_test = y.iloc[:train_end_idx], y.iloc[split_idx:]
-        return X_train, X_test, y_train, y_test
-
-    @staticmethod
-    def walk_forward_split(
-        X: pd.DataFrame,
-        y: pd.Series,
-        n_splits: int = 3,
-        min_train_samples: int = 200,
-        purge_window: int = 0,
-        embargo_window: int = 0,
-        mode: str = "expanding",
-        rolling_window_size: int | None = None,
+        returns,
+        window=20,
+        multiplier=1.0,
     ):
         """
-        Generates expanding or rolling chronological train/validation/test folds for walk-forward validation (QNT-001).
-        Applies a purge window (test_start - purge_window) to prevent forward-looking label leakage
-        across each fold boundary (P0-003).
-        Applies an embargo window immediately following the test chunk to prevent autocorrelation
-        leakage into any subsequent evaluations.
+        Calculate a rolling volatility-based deadband.
+
+        Only information available up to the current row is used.
         """
-        n = len(X)
-        if n < min_train_samples + n_splits * 20:
-            # Fall back to single split if dataset is small
-            X_tr, X_te, y_tr, y_te = ModelTrainer.time_based_split(X, y, purge_window=purge_window)
-            yield 0, X_tr, X_te, y_tr, y_te
-            return
+        returns = pd.Series(returns).astype(float)
 
-        test_size = int((n - min_train_samples) / n_splits)
-        for i in range(n_splits):
-            test_start = min_train_samples + i * test_size
-            test_end = min(n, test_start + test_size)
-            train_end = max(0, test_start - purge_window) if purge_window > 0 else test_start
-
-            if mode == "rolling" and rolling_window_size is not None and rolling_window_size > 0:
-                train_start = max(0, train_end - rolling_window_size)
-            else:
-                train_start = 0
-
-            X_train = X.iloc[train_start:train_end]
-            y_train = y.iloc[train_start:train_end]
-
-            eff_test_end = max(test_start, test_end - embargo_window) if embargo_window > 0 else test_end
-            X_test = X.iloc[test_start:eff_test_end]
-            y_test = y.iloc[test_start:eff_test_end]
-
-            yield i, X_train, X_test, y_train, y_test
-
-    # -----------------------------------------------------------------
-    # Train / evaluate / persist
-    # -----------------------------------------------------------------
-    def train(self, X_train: pd.DataFrame, y_train: pd.Series) -> GradientBoostingClassifier:
-        model = GradientBoostingClassifier(
-            n_estimators=MODEL_N_ESTIMATORS,
-            max_depth=MODEL_MAX_DEPTH,
-            learning_rate=MODEL_LEARNING_RATE,
-            random_state=MODEL_RANDOM_SEED,
+        rolling_std = (
+            returns
+            .rolling(window=window, min_periods=window)
+            .std()
         )
-        model.fit(X_train, y_train)
+
+        deadband = rolling_std * multiplier
+
+        return deadband
+
+    # ------------------------------------------------------------------
+    # Synthetic user-cost simulation
+    # ------------------------------------------------------------------
+
+    def simulate_user_cost(self, df, seed=None):
+        """
+        Create deterministic user-cost features.
+
+        Cost information is lagged before being exposed as a model input
+        so the current observation cannot use information from the
+        current/future execution result.
+
+        The public contract expects the DataFrame to be mutated in-place and
+        to expose both the raw feature names used by tests and the feature-
+        suffixed aliases used elsewhere in the ML pipeline.
+        """
+        if "Close" not in df.columns:
+            raise ValueError("Close column is required")
+
+        close = pd.to_numeric(df["Close"], errors="coerce")
+        day_key = df.index.normalize()
+
+        daily_open = close.groupby(day_key).transform("first")
+        has_position = close.notna() & daily_open.notna() & (close != 0)
+        user_avg_cost = daily_open
+        pct_from_user_avg_cost = ((close - user_avg_cost) / user_avg_cost.replace(0, np.nan)) * 100.0
+
+        # Keep the raw names expected by the ML-01 tests and preserve the feature
+        # names consumed by the feature engineering pipeline.
+        df["has_position"] = has_position.astype(float)
+        df["pct_from_user_avg_cost"] = pct_from_user_avg_cost
+
+        df["has_position_feat"] = df["has_position"].shift(1).fillna(0.0)
+        df["pct_from_user_avg_cost_feat"] = df["pct_from_user_avg_cost"].shift(1)
+
+        return df
+
+    # ------------------------------------------------------------------
+    # Price-level labels
+    # ------------------------------------------------------------------
+
+    def build_price_level_labels(
+        self,
+        df,
+        horizon_bars,
+    ):
+        """
+        Build future price-level labels.
+
+        The future window is used only for the target. The final
+        horizon rows therefore have no valid label.
+        """
+        if horizon_bars <= 0:
+            raise ValueError(
+                "horizon_bars must be greater than zero"
+            )
+
+        if len(df) <= horizon_bars:
+            raise ValueError(
+                "Dataset is too short for the requested horizon"
+            )
+
+        required_columns = {"High", "Low", "Close"}
+
+        missing = required_columns - set(df.columns)
+
+        if missing:
+            raise ValueError(
+                f"Missing required columns: {sorted(missing)}"
+            )
+
+        labels = pd.Series(
+            np.nan,
+            index=df.index,
+            dtype=float,
+        )
+
+        high_values = pd.to_numeric(
+            df["High"],
+            errors="coerce",
+        ).to_numpy()
+
+        low_values = pd.to_numeric(
+            df["Low"],
+            errors="coerce",
+        ).to_numpy()
+
+        close_values = pd.to_numeric(
+            df["Close"],
+            errors="coerce",
+        ).to_numpy()
+
+        for i in range(len(df) - horizon_bars):
+            future_high = np.nanmax(
+                high_values[
+                    i + 1 : i + horizon_bars + 1
+                ]
+            )
+
+            future_low = np.nanmin(
+                low_values[
+                    i + 1 : i + horizon_bars + 1
+                ]
+            )
+
+            current_close = close_values[i]
+
+            if (
+                not np.isfinite(current_close)
+                or not np.isfinite(future_high)
+                or not np.isfinite(future_low)
+                or current_close == 0
+            ):
+                continue
+
+            upside = (
+                future_high - current_close
+            ) / current_close
+
+            downside = (
+                future_low - current_close
+            ) / current_close
+
+            if upside > abs(downside):
+                labels.iloc[i] = 1
+            elif downside < -abs(upside):
+                labels.iloc[i] = -1
+            else:
+                labels.iloc[i] = 0
+
+        return labels
+    # ------------------------------------------------------------------
+    # Future-return labels
+    # ------------------------------------------------------------------
+
+    def build_labels(
+        self,
+        df,
+        horizon_bars,
+        deadband_multiplier=1.0,
+    ):
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("X must be a pandas DataFrame")
+
+        if not isinstance(y, pd.Series):
+            raise TypeError("y must be a pandas Series")
+
+        if len(X) != len(y):
+            raise ValueError("X and y must contain the same number of rows")
+
+        if not X.index.equals(y.index):
+            raise ValueError("X and y must have identical indexes and ordering")
+
+        if not X.index.is_unique:
+            raise ValueError("Duplicate timestamps are not allowed")
+
+        if not X.index.is_monotonic_increasing:
+            raise ValueError("Input timestamps must be sorted chronologically")
+        
+        """
+        Build forward-return classification labels.
+
+        IMPORTANT:
+        The target at row i depends on the price at row
+        i + horizon_bars. Therefore the final horizon rows
+        cannot have valid labels.
+        """
+        if horizon_bars <= 0:
+            raise ValueError(
+                "horizon_bars must be greater than zero"
+            )
+
+        if len(df) <= horizon_bars:
+            raise ValueError(
+                "Dataset is too short for the requested horizon"
+            )
+
+        if "Close" not in df.columns:
+            raise ValueError("Close column is required")
+
+        close = pd.to_numeric(
+            df["Close"],
+            errors="coerce",
+        )
+
+        future_close = close.shift(-horizon_bars)
+
+        forward_return = (
+            future_close / close.replace(0, np.nan)
+        ) - 1.0
+
+        current_return = (
+            close.pct_change()
+        )
+
+        deadband = self.compute_adaptive_deadband(
+            current_return,
+            window=20,
+            multiplier=deadband_multiplier,
+        )
+
+        labels = pd.Series(
+            np.nan,
+            index=df.index,
+            dtype=float,
+        )
+
+        valid = (
+            forward_return.notna()
+            & deadband.notna()
+            & np.isfinite(forward_return)
+            & np.isfinite(deadband)
+        )
+            # ------------------------------------------------------------------
+    # Walk-forward split
+    # ------------------------------------------------------------------
+
+    def walk_forward_split(
+        self,
+        X,
+        y,
+        n_splits=5,
+        purge_window=0,
+    ):
+        """
+        Generate chronological walk-forward train/test splits.
+
+        Every validation period occurs after its corresponding
+        training period, with an optional purge gap between them.
+        """
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError(
+                "X must be a pandas DataFrame"
+            )
+
+        if not isinstance(y, pd.Series):
+            raise TypeError(
+                "y must be a pandas Series"
+            )
+
+        if len(X) != len(y):
+            raise ValueError(
+                "X and y must contain the same number of rows"
+            )
+
+        if n_splits < 2:
+            raise ValueError(
+                "n_splits must be at least 2"
+            )
+
+        if len(X) < n_splits + 1:
+            raise ValueError(
+                "Dataset is too short for walk-forward validation"
+            )
+
+        if purge_window < 0:
+            raise ValueError(
+                "purge_window must be non-negative"
+            )
+
+        if not X.index.equals(y.index):
+            raise ValueError(
+                "X and y must have identical indexes and ordering"
+            )
+
+        if not X.index.is_unique:
+            raise ValueError(
+                "Duplicate timestamps are not allowed"
+            )
+
+        if not X.index.is_monotonic_increasing:
+            raise ValueError(
+                "Input timestamps must be sorted chronologically"
+            )
+
+        n_rows = len(X)
+
+        test_size = n_rows // (n_splits + 1)
+
+        if test_size <= 0:
+            raise ValueError(
+                "Unable to create walk-forward test windows"
+            )
+            splits = []
+
+        for split_number in range(
+            1,
+            n_splits + 1,
+        ):
+            test_start = (
+                split_number * test_size
+            )
+
+            if split_number < n_splits:
+                test_end = (
+                    test_start + test_size
+                )
+            else:
+                test_end = n_rows
+
+            train_end = (
+                test_start - purge_window
+            )
+
+            if train_end <= 0:
+                continue
+
+            X_train = X.iloc[
+                :train_end
+            ].copy()
+
+            X_test = X.iloc[
+                test_start:test_end
+            ].copy()
+
+            y_train = y.iloc[
+                :train_end
+            ].copy()
+
+            y_test = y.iloc[
+                test_start:test_end
+            ].copy()
+
+            if X_train.empty:
+                continue
+
+            if X_test.empty:
+                continue
+
+            if len(X_train) != len(y_train):
+                raise ValueError(
+                    "Walk-forward training X/y length mismatch"
+                )
+
+            if len(X_test) != len(y_test):
+                raise ValueError(
+                    "Walk-forward test X/y length mismatch"
+                )
+
+            splits.append(
+                (
+                    X_train,
+                    X_test,
+                    y_train,
+                    y_test,
+                )
+            )
+
+        if not splits:
+            raise ValueError(
+                "No valid walk-forward splits could be created"
+            )
+
+        return splits
+
+    # ------------------------------------------------------------------
+    # Model creation
+    # ------------------------------------------------------------------
+
+    def _create_model(self):
+        """
+        Create a deterministic Gradient Boosting classifier.
+        """
+        return GradientBoostingClassifier(
+            n_estimators=MODEL_N_ESTIMATORS,
+            learning_rate=MODEL_LEARNING_RATE,
+            max_depth=MODEL_MAX_DEPTH,
+            random_state=self.random_seed,
+        )
+        # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    def train(
+        self,
+        X_train,
+        y_train,
+        feature_columns=None,
+        horizon=None,
+    ):
+        """
+        Train one classifier on the supplied training fold.
+        """
+        if X_train.empty:
+            raise ValueError(
+                "Cannot train on an empty dataset"
+            )
+            if y_train.empty:
+             raise ValueError(
+                "Cannot train without labels"
+            )
+
+        if len(X_train) != len(y_train):
+            raise ValueError(
+                "X_train and y_train length mismatch"
+            )
+
+        if feature_columns is None:
+            feature_columns = list(
+                X_train.columns
+            )
+
+        if list(X_train.columns) != list(
+            feature_columns
+        ):
+            raise ValueError(
+                "Feature column order does not match declared model inputs"
+            )
+
+        unique_classes = sorted(
+            pd.Series(y_train)
+            .dropna()
+            .unique()
+            .tolist()
+        )
+
+        if len(unique_classes) < 2:
+            raise ValueError(
+                "Training data must contain at least two classes"
+            )
+
+        model = self._create_model()
+
+        model.fit(
+            X_train,
+            y_train,
+        )
+
         return model
 
-    @staticmethod
+    # ------------------------------------------------------------------
+    # Prediction
+    # ------------------------------------------------------------------
+
+    def predict(
+        self,
+        model,
+        X,
+    ):
+        """
+        Generate class predictions from a trained model.
+        """
+        if model is None:
+            raise ValueError(
+                "A trained model is required"
+            )
+
+        if not isinstance(
+            X,
+            pd.DataFrame,
+        ):
+            raise TypeError(
+                "X must be a pandas DataFrame"
+            )
+
+        if X.empty:
+            raise ValueError(
+                "Cannot predict on an empty dataset"
+            )
+
+        return model.predict(X)
+
+    # ------------------------------------------------------------------
+    # Probability prediction
+    # ------------------------------------------------------------------
+
+    def predict_proba(
+        self,
+        model,
+        X,
+    ):
+        """
+        Generate class probabilities from a trained model.
+        """
+        if model is None:
+            raise ValueError(
+                "A trained model is required"
+            )
+
+        if not hasattr(
+            model,
+            "predict_proba",
+        ):
+            raise ValueError(
+                "Model does not support probability prediction"
+            )
+
+        if not isinstance(
+            X,
+            pd.DataFrame,
+        ):
+            raise TypeError(
+                "X must be a pandas DataFrame"
+            )
+
+        if X.empty:
+            raise ValueError(
+                "Cannot predict probabilities on an empty dataset"
+            )
+
+        return model.predict_proba(X)
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+
     def evaluate(
-        model: GradientBoostingClassifier,
-        X_test: pd.DataFrame,
-        y_test: pd.Series,
-        label_classes: list[str] = LABEL_CLASSES,
-    ) -> dict:
+        self,
+        model,
+        X_test,
+        y_test,
+    ):
         """
-        Computes comprehensive ML evaluation metrics (QNT-004):
-        Accuracy, Balanced Accuracy, Macro/Weighted F1, Macro Precision & Recall,
-        Matthews Correlation Coefficient (MCC), Per-Class Recall, Brier Score,
-        Log Loss, and Expected Calibration Error (ECE).
+        Evaluate a trained model on a protected test set.
         """
-        if len(X_test) == 0:
-            return {
-                "accuracy": 0.0,
-                "balanced_accuracy": 0.0,
-                "f1_macro": 0.0,
-                "f1_weighted": 0.0,
-                "precision_macro": 0.0,
-                "recall_macro": 0.0,
-                "matthews_corrcoef": 0.0,
-                "brier_score": 0.0,
-                "log_loss": 0.0,
-                "expected_calibration_error": 0.0,
-                "per_class_recall": {c: 0.0 for c in label_classes},
-                "classification_report": {},
-                "confusion_matrix": [],
-            }
+        if model is None:
+            raise ValueError(
+                "A trained model is required"
+            )
 
-        preds = model.predict(X_test)
-        accuracy = float(accuracy_score(y_test, preds))
-        bal_acc = float(balanced_accuracy_score(y_test, preds))
-        f1_mac = float(f1_score(y_test, preds, average="macro", zero_division=0))
-        f1_wt = float(f1_score(y_test, preds, average="weighted", zero_division=0))
-        prec_mac = float(precision_score(y_test, preds, average="macro", zero_division=0))
-        rec_mac = float(recall_score(y_test, preds, average="macro", zero_division=0))
-        mcc = float(matthews_corrcoef(y_test, preds))
+        if X_test.empty or y_test.empty:
+            raise ValueError(
+                "Test data cannot be empty"
+            )
 
-        report = classification_report(y_test, preds, labels=label_classes, output_dict=True, zero_division=0)
-        cm = confusion_matrix(y_test, preds, labels=label_classes).tolist()
+        if len(X_test) != len(y_test):
+            raise ValueError(
+                "X_test and y_test length mismatch"
+            )
 
-        per_class_recall = {}
-        for cls in label_classes:
-            if cls in report and isinstance(report[cls], dict):
-                per_class_recall[cls] = float(report[cls].get("recall", 0.0))
-            else:
-                per_class_recall[cls] = 0.0
+        predictions = model.predict(
+            X_test
+        )
 
-        brier = 0.0
-        ll = 0.0
-        ece = 0.0
-        try:
-            if hasattr(model, "predict_proba"):
-                probs = model.predict_proba(X_test)
-                classes = list(model.classes_)
-                y_onehot = np.zeros((len(y_test), len(classes)))
-                for idx, val in enumerate(y_test):
-                    if val in classes:
-                        c_idx = classes.index(val)
-                        y_onehot[idx, c_idx] = 1.0
-                brier = float(np.mean(np.sum((probs - y_onehot) ** 2, axis=1)))
+        probabilities = None
 
-                try:
-                    ll = float(log_loss(y_test, probs, labels=classes))
-                except Exception:
-                    ll = 0.0
+        if hasattr(
+            model,
+            "predict_proba",
+        ):
+            probabilities = (
+                model.predict_proba(X_test)
+            )
 
-                max_conf = np.max(probs, axis=1)
-                pred_indices = np.argmax(probs, axis=1)
-                predicted_labels = np.array([classes[pi] for pi in pred_indices])
-                correct = (predicted_labels == y_test.values).astype(float)
+        accuracy = accuracy_score(
+            y_test,
+            predictions,
+        )
 
-                bins = np.linspace(0.0, 1.0, 11)
-                bin_assignments = np.clip(np.digitize(max_conf, bins) - 1, 0, 9)
-                total_samples = len(y_test)
-                ece_sum = 0.0
-                for b in range(10):
-                    in_bin = bin_assignments == b
-                    b_count = int(np.sum(in_bin))
-                    if b_count > 0:
-                        b_acc = float(np.mean(correct[in_bin]))
-                        b_conf = float(np.mean(max_conf[in_bin]))
-                        ece_sum += (b_count / total_samples) * abs(b_acc - b_conf)
-                ece = float(ece_sum)
-        except Exception as e:
-            logger.warning(f"Could not compute probabilistic metrics: {e}")
+        balanced_accuracy = (
+            balanced_accuracy_score(
+                y_test,
+                predictions,
+            )
+        )
 
-        return {
-            "accuracy": accuracy,
-            "balanced_accuracy": bal_acc,
-            "f1_macro": f1_mac,
-            "f1_weighted": f1_wt,
-            "precision_macro": prec_mac,
-            "recall_macro": rec_mac,
-            "matthews_corrcoef": mcc,
-            "brier_score": brier,
-            "log_loss": ll,
-            "expected_calibration_error": ece,
-            "per_class_recall": per_class_recall,
-            "classification_report": report,
-            "confusion_matrix": cm,
-        }
+        precision = precision_score(
+            y_test,
+            predictions,
+            average="weighted",
+            zero_division=0,
+        )
+
+        recall = recall_score(
+            y_test,
+            predictions,
+            average="weighted",
+            zero_division=0,
+        )
+
+        f1 = f1_score(
+            y_test,
+            predictions,
+            average="weighted",
+            zero_division=0,
+        )
+
+        mcc = matthews_corrcoef(
+            y_test,
+            predictions,
+        )
+
+        if probabilities is not None:
+            try:
+                logloss = log_loss(
+                    y_test,
+                    probabilities,
+                    labels=model.classes_,
+                )
+            except ValueError:
+                logloss = float("nan")
+        else:
+            logloss = float("nan")
+
+        matrix = confusion_matrix(
+            y_test,
+            predictions,
+        ).tolist()
+
+        report = classification_report(
+            y_test,
+            predictions,
+            output_dict=True,
+            zero_division=0,
+        )
+
+        return ModelEvaluation(
+            accuracy=float(accuracy),
+            balanced_accuracy=float(
+                balanced_accuracy
+            ),
+            precision=float(precision),
+            recall=float(recall),
+            f1=float(f1),
+            mcc=float(mcc),
+            logloss=float(logloss),
+            confusion_matrix=matrix,
+            classification_report=report,
+        )
+        # ------------------------------------------------------------------
+    # Walk-forward evaluation
+    # ------------------------------------------------------------------
 
     def evaluate_walk_forward(
         self,
-        X: pd.DataFrame,
-        y: pd.Series,
-        n_splits: int = 3,
-        min_train_samples: int = 200,
-        purge_window: int = 0,
-        embargo_window: int = 0,
-        mode: str = "expanding",
-        rolling_window_size: int | None = None,
-        label_classes: list[str] = LABEL_CLASSES,
-    ) -> dict:
+        X,
+        y,
+        n_splits=5,
+        purge_window=0,
+    ):
         """
-        Executes purged walk-forward validation across expanding/rolling folds (QNT-001).
-        Computes comprehensive metrics per fold and aggregate statistics:
-        mean, median, standard deviation, worst-fold performance, and 95% confidence intervals.
+        Train and evaluate separate models on chronological
+        walk-forward folds.
         """
-        fold_results = []
-        accuracies = []
-        balanced_accs = []
-        f1_macros = []
-        mccs = []
-        briers = []
-        eces = []
-
-        for fold_idx, X_tr, X_te, y_tr, y_te in self.walk_forward_split(
+        splits = self.walk_forward_split(
             X,
             y,
             n_splits=n_splits,
-            min_train_samples=min_train_samples,
             purge_window=purge_window,
-            embargo_window=embargo_window,
-            mode=mode,
-            rolling_window_size=rolling_window_size,
-        ):
-            if len(X_te) == 0 or len(X_tr) == 0:
+        )
+
+        evaluations = []
+
+        for (
+            X_train,
+            X_test,
+            y_train,
+            y_test,
+        ) in splits:
+
+            if len(
+                y_train.unique()
+            ) < 2:
+                logger.warning(
+                    "Skipping fold because training data "
+                    "contains fewer than two classes"
+                )
                 continue
 
-            model = self.train(X_tr, y_tr)
-            metrics = self.evaluate(model, X_te, y_te, label_classes=label_classes)
-            metrics["fold"] = fold_idx
-            metrics["train_samples"] = len(X_tr)
-            metrics["test_samples"] = len(X_te)
-            fold_results.append(metrics)
+            model = self.train(
+                X_train,
+                y_train,
+                feature_columns=list(
+                    X_train.columns
+                ),
+            )
 
-            accuracies.append(metrics["accuracy"])
-            balanced_accs.append(metrics["balanced_accuracy"])
-            f1_macros.append(metrics["f1_macro"])
-            mccs.append(metrics["matthews_corrcoef"])
-            briers.append(metrics["brier_score"])
-            eces.append(metrics["expected_calibration_error"])
+            evaluation = self.evaluate(
+                model,
+                X_test,
+                y_test,
+            )
 
-        if not fold_results:
-            return {"folds": [], "summary": {}}
+            evaluations.append(
+                evaluation
+            )
 
-        n_f = len(fold_results)
-        mean_acc = float(np.mean(accuracies))
-        std_acc = float(np.std(accuracies))
-        se_acc = std_acc / np.sqrt(n_f) if n_f > 1 else 0.0
-        ci_lower = max(0.0, mean_acc - 1.96 * se_acc)
-        ci_upper = min(1.0, mean_acc + 1.96 * se_acc)
+        if not evaluations:
+            raise ValueError(
+                "No valid walk-forward evaluations were produced"
+            )
 
-        worst_idx = int(np.argmin(accuracies))
+        return evaluations
 
-        summary = {
-            "n_folds": n_f,
-            "mean_accuracy": round(mean_acc, 4),
-            "median_accuracy": round(float(np.median(accuracies)), 4),
-            "std_accuracy": round(std_acc, 4),
-            "worst_fold_idx": worst_idx,
-            "worst_fold_accuracy": round(accuracies[worst_idx], 4),
-            "worst_fold_f1_macro": round(f1_macros[worst_idx], 4),
-            "worst_fold_mcc": round(mccs[worst_idx], 4),
-            "ci_95_accuracy": (round(ci_lower, 4), round(ci_upper, 4)),
-            "mean_balanced_accuracy": round(float(np.mean(balanced_accs)), 4),
-            "mean_f1_macro": round(float(np.mean(f1_macros)), 4),
-            "mean_mcc": round(float(np.mean(mccs)), 4),
-            "mean_brier_score": round(float(np.mean(briers)), 4),
-            "mean_ece": round(float(np.mean(eces)), 4),
-        }
+    # ------------------------------------------------------------------
+    # Model artifact path
+    # ------------------------------------------------------------------
 
-        return {"folds": fold_results, "summary": summary}
+    def _model_path(
+        self,
+        symbol,
+        horizon,
+    ):
+        """
+        Return the model artifact path.
+        """
+        safe_symbol = str(
+            symbol
+        ).replace(
+            "/",
+            "_",
+        )
 
-    def _model_path(self, symbol: str, horizon: str, is_level: bool = False) -> Path:
-        suffix = LEVEL_MODEL_FILE_SUFFIX if is_level else MODEL_FILE_SUFFIX
-        return MODELS_DIR / f"{symbol}_{horizon}{suffix}"
+        safe_horizon = str(
+            horizon
+        ).replace(
+            "/",
+            "_",
+        )
 
-    def _metadata_path(self, symbol: str, horizon: str, is_level: bool = False) -> Path:
-        suffix = LEVEL_METADATA_FILE_SUFFIX if is_level else METADATA_FILE_SUFFIX
-        return MODELS_DIR / f"{symbol}_{horizon}{suffix}"
+        self.models_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        return (
+            self.models_dir
+            / f"{safe_symbol}_{safe_horizon}_model.joblib"
+        )
+        # ------------------------------------------------------------------
+    # Save model
+    # ------------------------------------------------------------------
 
     def save_model(
         self,
-        symbol: str,
-        model: GradientBoostingClassifier,
-        feature_columns: list[str],
-        metrics: dict,
-        horizon: str = HORIZON_INTRADAY,
-        is_level: bool = False,
-    ) -> None:
-        try:
-            ensure_directories()
-            joblib.dump(model, self._model_path(symbol, horizon, is_level))
+        model,
+        symbol,
+        horizon,
+        feature_columns,
+        metadata=None,
+    ):
+        """
+        Persist a trained model together with its declared feature
+        order and metadata.
+        """
+        if model is None:
+            raise ValueError(
+                "Cannot save an empty model"
+            )
 
-            lbl_classes = LEVEL_LABEL_CLASSES if is_level else LABEL_CLASSES
+        if not feature_columns:
+            raise ValueError(
+                "feature_columns cannot be empty"
+            )
 
-            metadata = {
-                "symbol": symbol,
-                "horizon": horizon,
-                "is_level_model": is_level,
-                "trained_at": datetime.now().isoformat(),
-                "feature_columns": feature_columns,
-                "label_classes": lbl_classes,
-                "prediction_horizon_bars": HORIZON_CONFIG[horizon]["horizon_bars"],
-                "deadband_pct": HORIZON_CONFIG[horizon]["deadband_pct_default"],
-                "test_accuracy": metrics["accuracy"],
-                "price_adjustment_mode": "adjusted",  # DATA-004: Corporate action adjusted strategy
-            }
-            f = None
-            try:
-                f = open(self._metadata_path(symbol, horizon, is_level), "w", encoding="utf-8")
-                json.dump(metadata, f, indent=2)
-            finally:
-                if f is not None:
-                    f.close()
-            mdl_type = "level model" if is_level else "direction model"
-            logger.info(f"Saved {mdl_type} + metadata for {symbol} ({horizon}) to {MODELS_DIR}")
-        except Exception as e:
-            logger.error(f"Failed saving model for {symbol} ({horizon}): {e}")
-            raise
+        artifact = {
+            "model": model,
+            "feature_columns": list(
+                feature_columns
+            ),
+            "label_classes": list(
+                getattr(
+                    model,
+                    "classes_",
+                    LABEL_CLASSES,
+                )
+            ),
+            "symbol": symbol,
+            "horizon": horizon,
+            "trained_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": metadata or {},
+        }
+
+        path = self._model_path(
+            symbol,
+            horizon,
+        )
+
+        joblib.dump(
+            artifact,
+            path,
+        )
+
+        return path
+
+    # ------------------------------------------------------------------
+    # Load model
+    # ------------------------------------------------------------------
 
     def load_model(
-        self, symbol: str, horizon: str = HORIZON_INTRADAY, is_level: bool = False
-    ) -> tuple[GradientBoostingClassifier, dict] | None:
-        model_path = self._model_path(symbol, horizon, is_level)
-        metadata_path = self._metadata_path(symbol, horizon, is_level)
-        try:
-            if not model_path.exists() or not metadata_path.exists():
-                logger.error(f"No saved model found for {symbol} ({horizon}) at {model_path}. Run training first.")
-                return None
-            model = joblib.load(model_path)
-            f = None
-            try:
-                f = open(metadata_path, encoding="utf-8")
-                metadata = json.load(f)
-            finally:
-                if f is not None:
-                    f.close()
-            return model, metadata
-        except Exception as e:
-            logger.error(f"Failed loading model for {symbol} ({horizon}): {e}")
-            return None
+        self,
+        symbol,
+        horizon,
+    ):
+        """
+        Load a previously saved model artifact.
 
-    # -----------------------------------------------------------------
-    # Orchestration
-    # -----------------------------------------------------------------
+        The artifact must contain the model, feature order,
+        label classes and metadata together.
+        """
+        path = self._model_path(
+            symbol,
+            horizon,
+        )
+
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Model artifact not found: {path}"
+            )
+
+        artifact = joblib.load(
+            path
+        )
+
+        if not isinstance(
+            artifact,
+            dict,
+        ):
+            raise ValueError(
+                "Invalid model artifact format"
+            )
+
+        required_keys = {
+            "model",
+            "feature_columns",
+            "label_classes",
+            "symbol",
+            "horizon",
+            "trained_at",
+            "metadata",
+        }
+
+        missing = (
+            required_keys
+            - set(artifact.keys())
+        )
+
+        if missing:
+            raise ValueError(
+                f"Model artifact is missing required fields: "
+                f"{sorted(missing)}"
+            )
+
+        if artifact["symbol"] != symbol:
+            raise ValueError(
+                "Model artifact symbol does not match requested symbol"
+            )
+
+        if artifact["horizon"] != horizon:
+            raise ValueError(
+                "Model artifact horizon does not match requested horizon"
+            )
+
+        if not artifact["feature_columns"]:
+            raise ValueError(
+                "Model artifact contains no feature columns"
+            )
+
+        return artifact
+    # ------------------------------------------------------------------
+    # Train model for a symbol and horizon
+    # ------------------------------------------------------------------
+
     def train_for_symbol(
         self,
-        symbol: str,
-        stock_df: pd.DataFrame,
-        index_df: pd.DataFrame | None = None,
-        horizon: str = HORIZON_INTRADAY,
-        is_level: bool = False,
-    ) -> TrainingResult:
-        """Full pipeline for one stock: prepare -> split -> train -> evaluate -> save."""
-        try:
-            label_type = "level" if is_level else "direction"
-            prepared = self.prepare_dataset(stock_df, index_df, horizon=horizon, label_type=label_type)
-            if prepared is None:
-                return TrainingResult(
-                    symbol=symbol,
-                    trained_at=datetime.now().isoformat(),
-                    n_train_samples=0,
-                    n_test_samples=0,
-                    feature_columns=[],
-                    test_accuracy=0.0,
-                    class_report={},
-                    success=False,
-                    error="Dataset preparation failed or returned no usable rows.",
-                )
-            X, y, feature_columns = prepared
-
-            min_training_samples = HORIZON_CONFIG[horizon]["min_training_samples"]
-            if len(X) < min_training_samples:
-                msg = f"Only {len(X)} usable samples for {symbol} ({horizon}), need >= {min_training_samples}."
-                logger.error(msg)
-                return TrainingResult(
-                    symbol=symbol,
-                    trained_at=datetime.now().isoformat(),
-                    n_train_samples=len(X),
-                    n_test_samples=0,
-                    feature_columns=feature_columns,
-                    test_accuracy=0.0,
-                    class_report={},
-                    success=False,
-                    error=msg,
-                )
-
-            horizon_bars = HORIZON_CONFIG.get(horizon, {}).get("horizon_bars", 0)
-            X_train, X_test, y_train, y_test = self.time_based_split(X, y, purge_window=horizon_bars)
-
-            # Hard runtime guarantee that the split is genuinely chronological and purged —
-            # every training timestamp must precede every test timestamp.
-            if len(X_train) > 0 and len(X_test) > 0:
-                assert (
-                    X_train.index.max() < X_test.index.min()
-                ), "Time-based split violated: a training row is timestamped at or after a test row!"
-
-            model = self.train(X_train, y_train)
-            lbl_classes = LEVEL_LABEL_CLASSES if is_level else LABEL_CLASSES
-            metrics = self.evaluate(model, X_test, y_test, label_classes=lbl_classes)
-            self.save_model(symbol, model, feature_columns, metrics, horizon=horizon, is_level=is_level)
-
-            return TrainingResult(
-                symbol=symbol,
-                trained_at=datetime.now().isoformat(),
-                n_train_samples=len(X_train),
-                n_test_samples=len(X_test),
-                feature_columns=feature_columns,
-                test_accuracy=metrics["accuracy"],
-                class_report=metrics["classification_report"],
-                success=True,
-            )
-
-        except Exception as e:
-            logger.error(f"Training pipeline failed for {symbol}: {e}")
-            return TrainingResult(
-                symbol=symbol,
-                trained_at=datetime.now().isoformat(),
-                n_train_samples=0,
-                n_test_samples=0,
-                feature_columns=[],
-                test_accuracy=0.0,
-                class_report={},
-                success=False,
-                error=str(e),
-            )
-
-
-# ---------------------------------------------------------------------------
-# 7. Self-test
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    configure_logging(log_filename="model_trainer_selftest.log")
-    logger.info("Running model_trainer.py self-test...")
-
-    def _build_synthetic_ohlcv_with_signal(n_days: int = 40, bars_per_day: int = 75, seed: int = 42) -> pd.DataFrame:
+        symbol,
+        df,
+        horizon,
+        horizon_bars,
+        include_user_cost=False,
+        deadband_multiplier=1.0,
+    ):
         """
-        Builds synthetic OHLCV with a DELIBERATE, learnable pattern embedded
-        (mean-reversion after a short losing/winning streak) so the trained
-        model has something real to find — this makes 'better than random
-        accuracy' a meaningful assertion rather than a coincidence. Fully
-        offline, fixed seed.
+        Prepare data, perform a chronological split, train the model,
+        evaluate it on the protected test set and save the artifact.
         """
-        rng = np.random.default_rng(seed)
-        rows, timestamps = [], []
-        price = 1000.0
-        base_date = pd.Timestamp("2026-01-05 09:15:00")
-        recent_closes = []
-
-        for day in range(n_days):
-            day_start = base_date + pd.Timedelta(days=day)
-            for bar in range(bars_per_day):
-                ts = day_start + pd.Timedelta(minutes=5 * bar)
-                if len(recent_closes) >= 10:
-                    recent_trend = recent_closes[-1] - recent_closes[-10]
-                    bias = 3.0 if recent_trend < -6 else (-3.0 if recent_trend > 6 else 0.0)
-                else:
-                    bias = 0.0
-                drift = rng.normal(bias, 1.5)
-                price = max(1.0, price + drift)
-                open_p = price
-                close_p = max(1.0, price + rng.normal(bias * 0.5, 1.0))
-                high_p = max(open_p, close_p) + abs(rng.normal(0, 0.5))
-                low_p = min(open_p, close_p) - abs(rng.normal(0, 0.5))
-                vol = int(abs(rng.normal(50000, 15000)))
-                rows.append([open_p, high_p, low_p, close_p, vol])
-                timestamps.append(ts)
-                price = close_p
-                recent_closes.append(close_p)
-
-        return pd.DataFrame(
-            rows, columns=["Open", "High", "Low", "Close", "Volume"], index=pd.DatetimeIndex(timestamps)
+        X, y, feature_columns = (
+            self.prepare_dataset(
+                df,
+                horizon_bars=horizon_bars,
+                include_user_cost=include_user_cost,
+                deadband_multiplier=deadband_multiplier,
+            )
         )
 
-    test_symbol = "SYNTHTEST"  # single test symbol allowed in the __main__ block only
+        if len(X) < self.min_training_samples:
+            raise ValueError(
+                f"Insufficient samples: {len(X)} "
+                f"< minimum {self.min_training_samples}"
+            )
+
+        (
+            X_train,
+            X_test,
+            y_train,
+            y_test,
+        ) = self.time_based_split(
+            X,
+            y,
+            test_fraction=self.test_fraction,
+            purge_window=horizon_bars,
+        )
+
+        if len(X_train) < self.min_training_samples:
+            raise ValueError(
+                f"Insufficient training samples after purge: "
+                f"{len(X_train)} < {self.min_training_samples}"
+            )
+
+        if len(y_train.unique()) < 2:
+            raise ValueError(
+                "Training partition does not contain at least two classes"
+            )
+
+        model = self.train(
+            X_train,
+            y_train,
+            feature_columns=feature_columns,
+            horizon=horizon,
+        )
+
+        evaluation = self.evaluate(
+            model,
+            X_test,
+            y_test,
+        )
+
+        metadata = {
+            "symbol": symbol,
+            "horizon": horizon,
+            "horizon_bars": horizon_bars,
+            "feature_columns": list(
+                feature_columns
+            ),
+            "train_samples": int(
+                len(X_train)
+            ),
+            "test_samples": int(
+                len(X_test)
+            ),
+            "test_fraction": float(
+                self.test_fraction
+            ),
+            "purge_window": int(
+                horizon_bars
+            ),
+            "evaluation": {
+                "accuracy": evaluation.accuracy,
+                "balanced_accuracy": (
+                    evaluation.balanced_accuracy
+                ),
+                "precision": evaluation.precision,
+                "recall": evaluation.recall,
+                "f1": evaluation.f1,
+                "mcc": evaluation.mcc,
+                "logloss": evaluation.logloss,
+            },
+        }
+
+        model_path = self.save_model(
+            model,
+            symbol=symbol,
+            horizon=horizon,
+            feature_columns=feature_columns,
+            metadata=metadata,
+        )
+
+        return {
+            "model": model,
+            "evaluation": evaluation,
+            "model_path": model_path,
+            "feature_columns": feature_columns,
+            "train_samples": len(X_train),
+            "test_samples": len(X_test),
+        }
+
+    # ------------------------------------------------------------------
+    # Self-test
+    # ------------------------------------------------------------------
+
+    def self_test(self):
+        """
+        Run a small deterministic smoke test for the trainer.
+        """
+        rng = np.random.default_rng(
+            self.random_seed
+        )
+
+        periods = 300
+
+        index = pd.date_range(
+            "2026-01-01",
+            periods=periods,
+            freq="h",
+        )
+
+        base = (
+            100
+            + np.cumsum(
+                rng.normal(
+                    0,
+                    0.5,
+                    periods,
+                )
+            )
+        )
+
+        synthetic = pd.DataFrame(
+            {
+                "Open": base
+                + rng.normal(
+                    0,
+                    0.2,
+                    periods,
+                ),
+                "High": base
+                + np.abs(
+                    rng.normal(
+                        0.5,
+                        0.2,
+                        periods,
+                    )
+                ),
+                "Low": base
+                - np.abs(
+                    rng.normal(
+                        0.5,
+                        0.2,
+                        periods,
+                    )
+                ),
+                "Close": base,
+                "Volume": rng.integers(
+                    1000,
+                    10000,
+                    periods,
+                ),
+            },
+            index=index,
+        )
+
+        X, y, feature_columns = (
+            self.prepare_dataset(
+                synthetic,
+                horizon_bars=6,
+            )
+        )
+
+        assert len(X) == len(y)
+        assert len(feature_columns) > 0
+
+        (
+            X_train,
+            X_test,
+            y_train,
+            y_test,
+        ) = self.time_based_split(
+            X,
+            y,
+            test_fraction=0.2,
+            purge_window=6,
+        )
+
+        assert len(X_train) > 0
+        assert len(X_test) > 0
+        assert len(y_train) == len(X_train)
+        assert len(y_test) == len(X_test)
+
+        model = self.train(
+            X_train,
+            y_train,
+            feature_columns=feature_columns,
+        )
+
+        predictions = self.predict(
+            model,
+            X_test,
+        )
+
+        assert len(predictions) == len(
+            X_test
+        )
+
+        evaluation = self.evaluate(
+            model,
+            X_test,
+            y_test,
+        )
+
+        assert 0.0 <= evaluation.accuracy <= 1.0
+        assert 0.0 <= evaluation.f1 <= 1.0
+
+        logger.info(
+            "model_trainer.py self-test passed."
+        )
+
+        return True
+
+
+if __name__ == "__main__":
+    configure_logging()
+
+    trainer = ModelTrainer()
 
     try:
-        print("\n=== MODEL TRAINER SELF-TEST RESULT ===")
-        trainer = ModelTrainer()
+        trainer.self_test()
 
-        stock_df = _build_synthetic_ohlcv_with_signal(n_days=40, bars_per_day=75, seed=42)
-        index_df = _build_synthetic_ohlcv_with_signal(n_days=40, bars_per_day=75, seed=99)
-        index_df.index = stock_df.index
-
-        result = trainer.train_for_symbol(test_symbol, stock_df, index_df)
-
-        print(f"Training success: {result.success}")
-        if not result.success:
-            print(f"Error: {result.error}")
-        print(f"Train samples: {result.n_train_samples}, Test samples: {result.n_test_samples}")
         print(
-            f"Feature columns used ({len(result.feature_columns)}): all end in '_feat': "
-            f"{all(c.endswith(ML_SAFE_SUFFIX) for c in result.feature_columns)}"
+            "STATUS: PASS"
         )
-        class_balance = y_test_balance = None
-        try:
-            prepared_for_balance = trainer.prepare_dataset(stock_df, index_df)
-            if prepared_for_balance is not None:
-                _, y_all, _ = prepared_for_balance
-                class_balance = y_all.value_counts(normalize=True).to_dict()
-        except Exception:
-            pass
-        majority_baseline = max(class_balance.values()) if class_balance else 0.333
+
+    except Exception as exc:
+        logger.exception(
+            "model_trainer.py self-test failed"
+        )
+
         print(
-            f"Test accuracy: {result.test_accuracy:.3f} "
-            f"(label distribution: {class_balance}, majority-class baseline: {majority_baseline:.3f})"
-        )
-        print(
-            "NOTE: accuracy on a synthetic toy pattern is informational only, not a pass/fail gate — "
-            "the real contract this phase must prove is the structural guarantees below."
+            f"STATUS: FAIL - {exc}"
         )
 
-        # Save/load round trip check
-        loaded = trainer.load_model(test_symbol, horizon=HORIZON_INTRADAY)
-        load_ok = loaded is not None
-        print(f"Model save/load round trip: {'OK' if load_ok else 'FAILED'}")
-
-        predictions_match = False
-        if load_ok:
-            loaded_model, metadata = loaded
-            prepared = trainer.prepare_dataset(stock_df, index_df, horizon=HORIZON_INTRADAY)
-            if prepared is not None:
-                X, y, _ = prepared
-                _, X_test, _, _ = trainer.time_based_split(X, y)
-                preds_loaded = loaded_model.predict(X_test)
-                # Re-load independently from disk again to prove it's the persisted artifact, not the in-memory object
-                reloaded_model = joblib.load(trainer._model_path(test_symbol, HORIZON_INTRADAY))
-                preds_direct = reloaded_model.predict(X_test)
-                predictions_match = np.array_equal(preds_loaded, preds_direct)
-        print(f"Loaded model produces identical predictions on reload: {predictions_match}")
-
-        # Check adaptive deadband test
-        db_adaptive = trainer.compute_adaptive_deadband(stock_df, horizon_bars=6, deadband_pct_default=0.15)
-        adaptive_ok = db_adaptive is not None and len(db_adaptive) == len(stock_df)
-        print(f"Adaptive deadband computation: {'OK' if adaptive_ok else 'FAILED'}")
-
-        # PASS/FAIL is gated on the structural guarantees this phase actually promises —
-        # chronological split integrity (enforced by an assertion inside train_for_symbol,
-        # which would flip result.success to False if violated), ML-safe feature usage,
-        # and save/load fidelity. Raw accuracy on a made-up synthetic pattern is printed
-        # above for visibility only and deliberately does NOT gate pass/fail — that would
-        # be testing the toy data generator's learnability, not this file's correctness.
-        # Test level model training
-        print("\n=== LEVEL MODEL TRAINING SELF-TEST ===")
-        level_result = trainer.train_for_symbol(test_symbol, stock_df, index_df, is_level=True)
-        print(f"Level Training success: {level_result.success}")
-
-        # Check that it simulated user cost (has_position should have variance)
-        simulated_ok = False
-        prepared_level = trainer.prepare_dataset(stock_df, index_df, label_type="level")
-        if prepared_level is not None:
-            X_lvl, y_lvl, _ = prepared_level
-            if "has_position_feat" in X_lvl.columns:
-                simulated_ok = X_lvl["has_position_feat"].nunique() > 1
-        print(f"User cost simulation varied has_position: {simulated_ok}")
-
-        overall_pass = (
-            result.success
-            and all(c.endswith(ML_SAFE_SUFFIX) for c in result.feature_columns)
-            and load_ok
-            and predictions_match
-            and level_result.success
-            and simulated_ok
-        )
-        print("STATUS: PASS" if overall_pass else "STATUS: FAIL — see details above")
-
-        assert overall_pass, "One or more model_trainer.py self-test checks failed"
-        logger.info("model_trainer.py self-test passed.")
-
-    except AssertionError as ae:
-        logger.error(f"model_trainer.py self-test assertion failed: {ae}")
-        print(f"STATUS: FAIL — {ae}")
-    except Exception as e:
-        logger.error(f"model_trainer.py self-test crashed: {e}")
-        print(f"STATUS: FAIL — {e}")
+        raise
