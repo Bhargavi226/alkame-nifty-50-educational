@@ -314,10 +314,13 @@ class EnsembleManager:
             run_dir.mkdir(parents=True, exist_ok=True)
 
             bundle = {"models": fitted_models, "classes": LABEL_CLASSES}
-            joblib.dump(bundle, run_dir / "ensemble.joblib")
+            tmp_model_path = run_dir / "ensemble.joblib.tmp"
+            final_model_path = run_dir / "ensemble.joblib"
+
+            joblib.dump(bundle, tmp_model_path)
+            tmp_model_path.replace(final_model_path)
 
             import sklearn
-
             metadata = {
                 "model_id": model_id,
                 "run_id": run_id,
