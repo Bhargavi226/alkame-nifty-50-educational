@@ -1,22 +1,20 @@
+import numpy as np
 import pandas as pd
 import pytest
 
 from feature_engineer import FeatureEngineer
 
 
-def test_daily_outperformance_is_five_percentage_points():
-    timestamps = pd.to_datetime([
-        "2026-09-08 09:15",
-        "2026-09-08 15:15",
-    ])
+def test_daily_outperformance_uses_consecutive_closes():
+    idx = pd.date_range("2026-01-01", periods=2, freq="D")
 
-    stock_close = pd.Series([100.0, 110.0], index=timestamps)
-    index_close = pd.Series([100.0, 105.0], index=timestamps)
+    stock = pd.Series([100.0, 110.0], index=idx)
+    index = pd.Series([100.0, 105.0], index=idx)
 
-    outperformance, flag = FeatureEngineer.compute_outperformance(
-        stock_close,
-        index_close,
+    outperformance, flag = (
+        FeatureEngineer.compute_outperformance(stock, index)
     )
 
-    assert outperformance.iloc[-1] == pytest.approx(5.0)
-    assert flag.iloc[-1]
+    assert np.isnan(outperformance.iloc[0])
+    assert outperformance.iloc[1] == pytest.approx(5.0)
+    assert bool(flag.iloc[1]) is True

@@ -542,25 +542,15 @@ class FeatureEngineer:
                 day_key
             ).transform("first")
 
-            stock_pct = (
-                (aligned_stock - stock_day_open)
-                / stock_day_open
-            ) * 100.0
-
-            index_pct = (
-                (aligned_index - index_day_open)
-                / index_day_open
-            ) * 100.0
+            # Compare consecutive daily closes
+            stock_pct = aligned_stock.pct_change() * 100.0
+            index_pct = aligned_index.pct_change() * 100.0
 
             outperformance = stock_pct - index_pct
 
-            flag = (
-                outperformance.abs()
-                >= threshold_pct
-            )
+            flag = outperformance > 0
 
             return outperformance, flag
-
         except Exception as e:
             logger.error(
                 f"Failed computing outperformance: {e}"
@@ -1579,14 +1569,10 @@ if __name__ == "__main__":
             -1,
             mutated_df.columns.get_loc("Volume"),
         ] *= 20
-
-        mutated_features = (
-            engineer.engineer_features(
-                mutated_df,
-                index_df,
-            )
+        mutated_features = engineer.engineer_features(
+            mutated_df,
+            index_df,
         )
-
         feat_cols = [
             c
             for c in features.columns
