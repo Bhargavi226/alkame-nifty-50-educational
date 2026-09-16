@@ -333,10 +333,50 @@ class ModelTrainer:
 
         valid = (
             forward_return.notna()
-            & deadband.notna()
+            & deadband. notna()
             & np.isfinite(forward_return)
             & np.isfinite(deadband)
         )
+    def time_based_split(
+        self,
+        X,
+        y,
+        test_fraction=0.2,
+        purge_window=0,
+    ): 
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("X must be a pandas DataFrame")
+
+        if not isinstance(y, pd.Series):
+            raise TypeError("y must be a pandas Series")
+
+        if len(X) != len(y):
+            raise ValueError("X and y must contain the same number of rows")
+
+        if X.index.has_duplicates:
+            raise ValueError("X timestamps must not contain duplicates")
+
+        if not X.index.is_monotonic_increasing:
+            raise ValueError("X timestamps must be sorted")
+
+        n = len(X)
+        test_size = int(n * test_fraction)
+
+        if test_size <= 0:
+            raise ValueError("test_fraction produces an empty test set")
+
+        test_start = n - test_size
+        train_end = test_start - purge_window
+
+        if train_end <= 0:
+            raise ValueError("Insufficient samples for time-based split")
+
+        X_train = X.iloc[:train_end].copy()
+        X_test = X.iloc[test_start:].copy()
+        y_train = y.iloc[:train_end].copy()
+        y_test = y.iloc[test_start:].copy()
+
+        return X_train, X_test, y_train, y_test
             # ------------------------------------------------------------------
     # Walk-forward split
     # ------------------------------------------------------------------
